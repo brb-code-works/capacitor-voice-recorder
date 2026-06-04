@@ -151,6 +151,20 @@ public class CustomMediaRecorder implements AudioManager.OnAudioFocusChangeListe
         return currentRecordingStatus;
     }
 
+    /**
+     * Peak amplitude since the last call (0..32767). Safe to call in any
+     * state: returns 0 unless actively recording (getMaxAmplitude on a
+     * released MediaRecorder throws).
+     */
+    public int getMaxAmplitude() {
+        if (currentRecordingStatus != CurrentRecordingStatus.RECORDING) return 0;
+        try {
+            return mediaRecorder.getMaxAmplitude();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     public boolean deleteOutputFile() {
         return outputFile.delete();
     }

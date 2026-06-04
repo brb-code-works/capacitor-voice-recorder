@@ -6,6 +6,9 @@ import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.util.Base64;
+import android.os.Handler;
+import android.os.Looper;
+import com.getcapacitor.JSObject;
 import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -26,6 +29,37 @@ public class VoiceRecorder extends Plugin {
 
     static final String RECORD_AUDIO_ALIAS = "voice recording";
     private CustomMediaRecorder mediaRecorder;
+
+    private static final int AMPLITUDE_POLL_MS = 120;
+    private static final long MAX_INLINE_FILE_BYTES = 10L * 1024 * 1024;
+    private Handler amplitudeHandler;
+    private final Runnable amplitudePoller = new Runnable() {
+        @Override
+        public void run() {
+            CustomMediaRecorder recorder = mediaRecorder;
+            if (recorder == null) return;
+            int amp = recorder.getMaxAmplitude();
+            JSObject data = new JSObject();
+            data.put("value", amp / 32767.0);
+            notifyListeners("amplitude", data);
+            if (amplitudeHandler != null) {
+                amplitudeHandler.postDelayed(this, AMPLITUDE_POLL_MS);
+            }
+        }
+    };
+
+    private void startAmplitudePolling() {
+        stopAmplitudePolling();
+        amplitudeHandler = new Handler(Looper.getMainLooper());
+        amplitudeHandler.postDelayed(amplitudePoller, AMPLITUDE_POLL_MS);
+    }
+
+    private void stopAmplitudePolling() {
+        if (amplitudeHandler != null) {
+            amplitudeHandler.removeCallbacks(amplitudePoller);
+            amplitudeHandler = null;
+        }
+    }
 
     @PluginMethod
     public void canDeviceVoiceRecord(PluginCall call) {
@@ -93,6 +127,7 @@ public class VoiceRecorder extends Plugin {
             });
 
             mediaRecorder.startRecording();
+            startAmplitudePolling();
             call.resolve(ResponseGenerator.successResponse());
         } catch (Exception exp) {
             mediaRecorder = null;
@@ -102,6 +137,7 @@ public class VoiceRecorder extends Plugin {
 
     @PluginMethod
     public void stopRecording(PluginCall call) {
+        stopAmplitudePolling();
         if (mediaRecorder == null) {
             call.reject(Messages.RECORDING_HAS_NOT_STARTED);
             return;
@@ -111,6 +147,16 @@ public class VoiceRecorder extends Plugin {
             mediaRecorder.stopRecording();
             File recordedFile = mediaRecorder.getOutputFile();
             RecordOptions options = mediaRecorder.getRecordOptions();
+
+            // Guard: an unexpectedly long recording (suspended JS timers in
+            // background, lost stop) is read whole-file into memory and
+            // base64-encoded below — observed OOM-killing the host app at
+            // 135MB/799MB allocations. Reject like a failed fetch; callers
+            // already treat that error as skip-and-continue.
+            if (options.getDirectory() == null && recordedFile.length() > MAX_INLINE_FILE_BYTES) {
+                call.reject(Messages.FAILED_TO_FETCH_RECORDING);
+                return;
+            }
 
             String path = null;
             String recordDataBase64 = null;
