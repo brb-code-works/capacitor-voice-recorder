@@ -29,6 +29,7 @@ public class VoiceRecorder extends Plugin {
 
     static final String RECORD_AUDIO_ALIAS = "voice recording";
     private CustomMediaRecorder mediaRecorder;
+    private PcmStreamRecorder pcmStreamRecorder;
 
     private static final int AMPLITUDE_POLL_MS = 120;
     private static final long MAX_INLINE_FILE_BYTES = 10L * 1024 * 1024;
@@ -111,6 +112,11 @@ public class VoiceRecorder extends Plugin {
             return;
         }
 
+        if (pcmStreamRecorder != null && pcmStreamRecorder.isRunning()) {
+            call.reject(Messages.MICROPHONE_BEING_USED);
+            return;
+        }
+
         try {
             String directory = call.getString("directory");
             String subDirectory = call.getString("subDirectory");
@@ -133,6 +139,46 @@ public class VoiceRecorder extends Plugin {
             mediaRecorder = null;
             call.reject(Messages.FAILED_TO_RECORD, exp);
         }
+    }
+
+    @PluginMethod
+    public void startStreaming(PluginCall call) {
+        if (!doesUserGaveAudioRecordingPermission()) {
+            call.reject(Messages.MISSING_PERMISSION);
+            return;
+        }
+        if (mediaRecorder != null) {
+            call.reject(Messages.MICROPHONE_BEING_USED);
+            return;
+        }
+        if (pcmStreamRecorder != null && pcmStreamRecorder.isRunning()) {
+            call.resolve(ResponseGenerator.successResponse());
+            return;
+        }
+        boolean voiceComm = !"mic".equals(call.getString("audioSource", "voice_communication"));
+        try {
+            pcmStreamRecorder = new PcmStreamRecorder((pcm, peak) -> {
+                JSObject data = new JSObject();
+                data.put("data", Base64.encodeToString(pcm, Base64.NO_WRAP));
+                data.put("amplitude", peak);
+                data.put("sampleRate", PcmStreamRecorder.SAMPLE_RATE);
+                notifyListeners("pcmFrame", data);
+            });
+            pcmStreamRecorder.start(voiceComm);
+            call.resolve(ResponseGenerator.successResponse());
+        } catch (Exception exp) {
+            pcmStreamRecorder = null;
+            call.reject(Messages.FAILED_TO_RECORD, exp);
+        }
+    }
+
+    @PluginMethod
+    public void stopStreaming(PluginCall call) {
+        if (pcmStreamRecorder != null) {
+            pcmStreamRecorder.stop();
+            pcmStreamRecorder = null;
+        }
+        call.resolve(ResponseGenerator.successResponse());
     }
 
     @PluginMethod
