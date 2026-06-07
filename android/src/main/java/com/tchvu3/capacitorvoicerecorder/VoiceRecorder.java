@@ -30,6 +30,7 @@ public class VoiceRecorder extends Plugin {
     static final String RECORD_AUDIO_ALIAS = "voice recording";
     private CustomMediaRecorder mediaRecorder;
     private PcmStreamRecorder pcmStreamRecorder;
+    private ScoAudioManager scoManager;
 
     private static final int AMPLITUDE_POLL_MS = 120;
     private static final long MAX_INLINE_FILE_BYTES = 10L * 1024 * 1024;
@@ -48,6 +49,18 @@ public class VoiceRecorder extends Plugin {
             }
         }
     };
+
+    @Override
+    public void load() {
+        super.load();
+        scoManager = new ScoAudioManager(getContext());
+    }
+
+    private void emitScoState(String state) {
+        JSObject data = new JSObject();
+        data.put("state", state);
+        notifyListeners("scoStateChange", data);
+    }
 
     private void startAmplitudePolling() {
         stopAmplitudePolling();
@@ -156,6 +169,42 @@ public class VoiceRecorder extends Plugin {
             return;
         }
         boolean voiceComm = !"mic".equals(call.getString("audioSource", "voice_communication"));
+        boolean useSco = Boolean.TRUE.equals(call.getBoolean("useSco", false));
+
+        if (!useSco) {
+            beginPcmCapture(call, voiceComm);
+            return;
+        }
+
+        scoManager.start(new ScoAudioManager.Callback() {
+            @Override
+            public void onScoConnected() {
+                emitScoState("connected");
+                if (pcmStreamRecorder != null && pcmStreamRecorder.isRunning()) {
+                    call.resolve(ResponseGenerator.successResponse());
+                    return;
+                }
+                beginPcmCapture(call, true); // SCO up -> VOICE_COMMUNICATION
+            }
+
+            @Override
+            public void onScoFailed() {
+                emitScoState("failed");
+                JSObject ret = new JSObject();
+                ret.put("value", false);
+                ret.put("reason", "sco_failed");
+                call.resolve(ret); // resolve, not reject — JS owns the mode switch
+            }
+
+            @Override
+            public void onScoDisconnected() {
+                stopPcmInternal(); // headset mic is gone; no silent fallback
+                emitScoState("disconnected");
+            }
+        });
+    }
+
+    private void beginPcmCapture(PluginCall call, boolean voiceComm) {
         try {
             pcmStreamRecorder = new PcmStreamRecorder((pcm, peak) -> {
                 JSObject data = new JSObject();
@@ -172,11 +221,18 @@ public class VoiceRecorder extends Plugin {
         }
     }
 
-    @PluginMethod
-    public void stopStreaming(PluginCall call) {
+    private void stopPcmInternal() {
         if (pcmStreamRecorder != null) {
             pcmStreamRecorder.stop();
             pcmStreamRecorder = null;
+        }
+    }
+
+    @PluginMethod
+    public void stopStreaming(PluginCall call) {
+        stopPcmInternal();
+        if (scoManager != null) {
+            scoManager.stop();
         }
         call.resolve(ResponseGenerator.successResponse());
     }
