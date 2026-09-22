@@ -31,6 +31,7 @@ public class VoiceRecorder extends Plugin {
     private CustomMediaRecorder mediaRecorder;
     private PcmStreamRecorder pcmStreamRecorder;
     private ScoAudioManager scoManager;
+    private VoskRecognizer voskRecognizer;
 
     private static final int AMPLITUDE_POLL_MS = 120;
     private static final long MAX_INLINE_FILE_BYTES = 10L * 1024 * 1024;
@@ -54,6 +55,7 @@ public class VoiceRecorder extends Plugin {
     public void load() {
         super.load();
         scoManager = new ScoAudioManager(getContext());
+        voskRecognizer = new VoskRecognizer(getContext());
     }
 
     private void emitScoState(String state) {
@@ -168,6 +170,10 @@ public class VoiceRecorder extends Plugin {
             call.resolve(ResponseGenerator.successResponse());
             return;
         }
+        if (voskRecognizer != null && voskRecognizer.isRunning()) {
+            call.reject(Messages.MICROPHONE_BEING_USED);
+            return;
+        }
         boolean voiceComm = !"mic".equals(call.getString("audioSource", "voice_communication"));
         boolean useSco = Boolean.TRUE.equals(call.getBoolean("useSco", false));
 
@@ -231,6 +237,107 @@ public class VoiceRecorder extends Plugin {
     @PluginMethod
     public void stopStreaming(PluginCall call) {
         stopPcmInternal();
+        if (scoManager != null) {
+            scoManager.stop();
+        }
+        call.resolve(ResponseGenerator.successResponse());
+    }
+
+    /**
+     * On-device recognition: the same shape as startStreaming, but it emits
+     * recognised text (recognitionResult) instead of PCM frames. SCO first,
+     * then the recogniser -- Vosk's SpeechService opens its AudioRecord in its
+     * constructor, so building it before SCO connects records from the device
+     * mic.
+     *
+     * Options: model ("model-en-us" | "model-es"), grammar (JSON array of
+     * phrases, UTF-8), useSco.
+     */
+    @PluginMethod
+    public void startRecognition(PluginCall call) {
+        if (!doesUserGaveAudioRecordingPermission()) {
+            call.reject(Messages.MISSING_PERMISSION);
+            return;
+        }
+        if (mediaRecorder != null || (pcmStreamRecorder != null && pcmStreamRecorder.isRunning())) {
+            call.reject(Messages.MICROPHONE_BEING_USED);
+            return;
+        }
+        String model = call.getString("model", "model-en-us");
+        String grammar = call.getString("grammar");
+        if (grammar == null || grammar.isEmpty()) {
+            call.reject("grammar is required");
+            return;
+        }
+        boolean useSco = Boolean.TRUE.equals(call.getBoolean("useSco", false));
+
+        if (!useSco) {
+            beginRecognition(call, model, grammar);
+            return;
+        }
+        scoManager.start(new ScoAudioManager.Callback() {
+            @Override
+            public void onScoConnected() {
+                emitScoState("connected");
+                if (voskRecognizer.isRunning()) {
+                    call.resolve(ResponseGenerator.successResponse());
+                    return;
+                }
+                beginRecognition(call, model, grammar);
+            }
+
+            @Override
+            public void onScoFailed() {
+                emitScoState("failed");
+                JSObject ret = new JSObject();
+                ret.put("value", false);
+                ret.put("reason", "sco_failed");
+                call.resolve(ret); // resolve, not reject -- JS owns the mode switch
+            }
+
+            @Override
+            public void onScoDisconnected() {
+                voskRecognizer.stop(); // headset mic is gone; no silent fallback
+                emitScoState("disconnected");
+            }
+        });
+    }
+
+    private void beginRecognition(PluginCall call, String model, String grammar) {
+        voskRecognizer.start(model, grammar,
+            new VoskRecognizer.Listener() {
+                @Override
+                public void onText(String text) {
+                    JSObject data = new JSObject();
+                    data.put("text", text);
+                    notifyListeners("recognitionResult", data);
+                }
+
+                @Override
+                public void onError(String message) {
+                    JSObject data = new JSObject();
+                    data.put("error", message);
+                    notifyListeners("recognitionError", data);
+                }
+            },
+            new VoskRecognizer.StartCallback() {
+                @Override
+                public void onStarted() {
+                    call.resolve(ResponseGenerator.successResponse());
+                }
+
+                @Override
+                public void onError(String message) {
+                    call.reject(message);
+                }
+            });
+    }
+
+    @PluginMethod
+    public void stopRecognition(PluginCall call) {
+        if (voskRecognizer != null) {
+            voskRecognizer.stop();
+        }
         if (scoManager != null) {
             scoManager.stop();
         }
