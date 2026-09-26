@@ -35,6 +35,10 @@ public class VoskRecognizer {
     }
 
     private static final float SAMPLE_RATE = 16000.0f;
+    // Real speech measured at 1.0, a phantom from silence at 0.43. Plenty of
+    // room between them; this sits nearer the phantom so a genuinely mumbled
+    // word still gets through.
+    private static final double MIN_CONFIDENCE = 0.7;
 
     private final Context context;
     // Loaded once per language and kept. Unpacking takes seconds, and a shared
@@ -78,6 +82,12 @@ public class VoskRecognizer {
         if (mine != session) return; // stopped while the model was loading
         try {
             Recognizer rec = new Recognizer(model, SAMPLE_RATE, grammar);
+            // Per-word confidence. A decoder given a long quiet stretch
+            // endpoints anyway and returns its best path through the grammar --
+            // measured: eleven "help" results from silence, with TTS stopped
+            // and nothing audible. Confidence is how we tell those from speech,
+            // if it separates them at all.
+            rec.setWords(true);
             speechService = new SpeechService(rec, SAMPLE_RATE);
             speechService.startListening(new RecognitionListener() {
                 @Override public void onPartialResult(String hypothesis) { }
@@ -104,7 +114,31 @@ public class VoskRecognizer {
 
     private static void emit(String hypothesis, Listener listener) {
         try {
-            String text = new JSONObject(hypothesis).optString("text", "");
+            JSONObject obj = new JSONObject(hypothesis);
+            String text = obj.optString("text", "");
+            // Lowest per-word confidence in the result: one weak word is enough
+            // to make the whole thing suspect. Passed through for now rather
+            // than gated on, so the threshold can be set from measurements
+            // instead of guessed.
+            double worst = 1.0;
+            org.json.JSONArray words = obj.optJSONArray("result");
+            if (words != null) {
+                for (int i = 0; i < words.length(); i++) {
+                    double c = words.optJSONObject(i) == null
+                            ? 1.0 : words.optJSONObject(i).optDouble("conf", 1.0);
+                    if (c < worst) worst = c;
+                }
+            }
+            android.util.Log.i("VoskRecognizer", "result conf=" + worst + " text=" + text);
+            // A decoder given a long quiet stretch endpoints anyway and returns
+            // its best path through the grammar. Measured: a phantom "help"
+            // from silence scored 0.43 where every real utterance scored 1.0.
+            // It matters because help announces the current step, so the
+            // phantom announces, and the app talks to itself every 20 seconds.
+            if (worst < MIN_CONFIDENCE) {
+                android.util.Log.i("VoskRecognizer", "dropped, conf below " + MIN_CONFIDENCE);
+                return;
+            }
             // [unk] means "not one of mine". Alone it is nothing to act on; mixed
             // in ("[unk] nine four five" from an "uh") it is noise around a
             // real answer.
